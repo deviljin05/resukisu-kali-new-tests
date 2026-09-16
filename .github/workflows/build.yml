@@ -67,9 +67,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${TC_DIR}"
-          echo "Downloading ZyC Clang toolchain package..."
-          curl -LSs -o /tmp/zyc_clang.tar.gz \
-            https://github.com
+          echo "Resolving latest ZyC Clang release..."
+          API_RESPONSE="$(curl -fsSL -H "User-Agent: gha-kernel-build" -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/ZyCromerZ/Clang/releases/latest)"
+          ASSET_URL="$(printf '%s' "${API_RESPONSE}" \
+            | grep -oE '"browser_download_url":[[:space:]]*"[^"]+\.tar\.gz"' \
+            | sed -E 's/.*"(https:[^"]+)"/\1/' | head -n1)"
+          if [ -z "${ASSET_URL}" ]; then
+            echo "::error::Could not resolve a ZyC Clang release asset URL. API response was:"
+            echo "${API_RESPONSE}" | head -c 1000
+            exit 1
+          fi
+          echo "Downloading ZyC Clang toolchain package from: ${ASSET_URL}"
+          curl -LSs -H "User-Agent: gha-kernel-build" -o /tmp/zyc_clang.tar.gz "${ASSET_URL}"
+          if ! file /tmp/zyc_clang.tar.gz | grep -qi gzip; then
+            echo "::error::Downloaded file is not a gzip archive. Got:"
+            file /tmp/zyc_clang.tar.gz
+            head -c 500 /tmp/zyc_clang.tar.gz
+            exit 1
+          fi
           tar -xzf /tmp/zyc_clang.tar.gz -C "${TC_DIR}"
           rm -f /tmp/zyc_clang.tar.gz
           echo "${TC_DIR}/bin" >> "$GITHUB_PATH"
