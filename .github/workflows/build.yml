@@ -1,0 +1,743 @@
+name: Build Custom GKI Kernel (ReSukiSU + SUSFS + BBRv3 + Mizdrake7 In-Tree Modules)
+
+on:
+  workflow_dispatch:
+    inputs:
+      os_patch_level:
+        description: "'lts' = rolling LTS branch. A dated maintenance branch (e.g. android12-5.10-2026-07) tracks Google's latest upstream merges/ASB patches. Or pin an exact GKI release tag, e.g. android12-5.10.264_r00"
+        required: true
+        default: "android12-5.10.264_r00"
+      susfs_commit:
+        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
+        required: false
+        default: ""
+      device_name:
+        description: "Optional label for artifact naming"
+        required: false
+        default: "gki-custom"
+      enable_gaming_perf_tune:
+        description: "Enable gaming/latency perf tweaks"
+        required: true
+        default: "false"
+      enable_performance_governor:
+        description: "Force CPU default governor to 'performance'"
+        required: true
+        default: "false"
+
+env:
+  VERSION: android12-5.10
+  CCACHE_DIR: /home/runner/.ccache
+  TC_DIR: /home/runner/zyc_clang
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo apt-get clean
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl bc bison flex libssl-dev \
+            build-essential python3 python3-pip python-is-python3 libncurses-dev \
+            ccache zip unzip device-tree-compiler libelf-dev rsync \
+            lld llvm clang
+
+      - name: Install repo tool
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL https://googleapis.com -o ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@://github.com"
+
+      - name: Set up ccache
+        run: mkdir -p "${CCACHE_DIR}"
+
+      - name: Download and Setup ZyC Clang 14 (Dost Ka Custom Compiler)
+        run: |
+          set -euo pipefail
+          mkdir -p "${TC_DIR}"
+          echo "Downloading ZyC Clang toolchain package..."
+          curl -LSs -o /tmp/zyc_clang.tar.gz \
+            https://github.com
+          tar -xzf /tmp/zyc_clang.tar.gz -C "${TC_DIR}"
+          rm -f /tmp/zyc_clang.tar.gz
+          echo "${TC_DIR}/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve manifest branch and optional pinned release tag
+        run: |
+          set -euo pipefail
+          INPUT="${{ github.event.inputs.os_patch_level }}"
+          if [ "${INPUT}" = "lts" ]; then
+            MANIFEST_REF="common-${VERSION}-lts"
+            PIN_REF=""
+            PIN_TYPE=""
+          elif [[ "${INPUT}" =~ ^${VERSION}\.[0-9]+_r[0-9]+$ ]]; then
+            MANIFEST_REF="common-${VERSION}"
+            PIN_REF="${INPUT}"
+            PIN_TYPE="tag"
+          else
+            MANIFEST_REF="common-${VERSION}"
+            PIN_REF="${INPUT}"
+            PIN_TYPE="branch"
+          fi
+          echo "MANIFEST_REF=${MANIFEST_REF}" >> "$GITHUB_ENV"
+          echo "PIN_REF=${PIN_REF}" >> "$GITHUB_ENV"
+          echo "PIN_TYPE=${PIN_TYPE}" >> "$GITHUB_ENV"
+
+      - name: Sync GKI kernel source
+        run: |
+          set -euo pipefail
+          mkdir -p kernel_workspace
+          cd kernel_workspace
+          repo init -u https://googlesource.com -b "${MANIFEST_REF}" --depth=1
+          repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
+
+      - name: Pin kernel/common to exact tag or branch
+        if: ${{ env.PIN_TYPE != '' }}
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          REMOTE_NAME="$(git remote | head -n1)"
+          [ -n "${REMOTE_NAME}" ]
+          if [ "${PIN_TYPE}" = "tag" ]; then
+            git fetch --depth=1 "${REMOTE_NAME}" "refs/tags/${PIN_REF}:refs/tags/${PIN_REF}"
+            git checkout "refs/tags/${PIN_REF}"
+          else
+            git fetch --depth=1 "${REMOTE_NAME}" "refs/heads/${PIN_REF}:refs/remotes/${REMOTE_NAME}/${PIN_REF}"
+            git checkout -B "${PIN_REF}" "refs/remotes/${REMOTE_NAME}/${PIN_REF}"
+          fi
+
+      - name: Detect kernel sublevel
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
+          echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
+
+      - name: Clone SUSFS4KSU
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          git clone https://gitlab.com -b gki-android12-5.10 susfs4ksu
+          cd susfs4ksu
+          if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
+            git checkout "${{ github.event.inputs.susfs_commit }}"
+          fi
+          echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set Mizdrake7 Style Defconfig (SUSFS + Ptrace + eBPF + Unicode + Modular Wireless)
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+
+            # --- PTRACE FIXES & HARDENING CONFIGS ---
+            echo "CONFIG_HAVE_ARCH_PTRACE=y"
+            echo "CONFIG_PTRACE=y"
+
+            # --- FULL eBPF SUPPORT CONFIGS & PATCHES ---
+            echo "CONFIG_BPF=y"
+            echo "CONFIG_BPF_SYSCALL=y"
+            echo "CONFIG_BPF_JIT=y"
+            echo "CONFIG_BPF_JIT_ALWAYS_ON=y"
+            echo "CONFIG_NET_CLS_ACT=y"
+            echo "CONFIG_NET_ACT_BPF=y"
+            echo "CONFIG_NET_CLS_BPF=y"
+            echo "CONFIG_CGROUP_BPF=y"
+            echo "CONFIG_BPF_EVENTS=y"
+            echo "CONFIG_BPF_STREAM_PARSER=y"
+            echo "CONFIG_LWTUNNEL_BPF=y"
+
+            # --- UNICODE & UTF-8 FIXES CONFIGS ---
+            echo "CONFIG_UNICODE=y"
+            echo "CONFIG_NLS_UTF8=y"
+            echo "CONFIG_NLS_CODEPAGE_437=y"
+            echo "CONFIG_NLS_ISO8859_1=y"
+
+            # --- MIZDRAKE7 NETHUNTER WIRELESS CONFIGS (=m Modules Format) ---
+            echo "CONFIG_NETDEVICES=y"
+            echo "CONFIG_WLAN=y"
+            echo "CONFIG_WIRELESS=y"
+            echo "CONFIG_CFG80211=m"
+            echo "CONFIG_CFG80211_INTERNAL_REGDB=y"
+            echo "CONFIG_MAC80211=m"
+            echo "CONFIG_MAC80211_HAS_RC=y"
+            echo "CONFIG_MAC80211_RC_MINSTREL=y"
+            echo "CONFIG_MAC80211_RC_DEFAULT_MINSTREL=y"
+
+            # Nethunter Core Features
+            echo "CONFIG_PACKET_DIAG=y"
+            echo "CONFIG_USB_G_HID=y"
+
+            # Atheros Suite
+            echo "CONFIG_WLAN_VENDOR_ATH=y"
+            echo "CONFIG_ATH9K_HTC=m"
+            echo "CONFIG_ATH_CARDS=m"
+            echo "CONFIG_CARL9170=m"
+
+            # Ralink / RT2800 Suite
+            echo "CONFIG_WLAN_VENDOR_RALINK=y"
+            echo "CONFIG_RT2X00=m"
+            echo "CONFIG_RT2X00_LIB=m"
+            echo "CONFIG_RT2X00_LIB_USB=m"
+            echo "CONFIG_RT2800USB=m"
+            echo "CONFIG_RT2800USB_RT33XX=y"
+            echo "CONFIG_RT2800USB_RT35XX=y"
+            echo "CONFIG_RT2800USB_RT3573=y"
+            echo "CONFIG_RT2800USB_RT53XX=y"
+            echo "CONFIG_RT2800USB_RT55XX=y"
+            echo "CONFIG_RT2800USB_UNKNOWN=y"
+
+            # Realtek Base Drivers
+            echo "CONFIG_WLAN_VENDOR_REALTEK=y"
+            echo "CONFIG_RTL8187=m"
+            echo "CONFIG_RTL8192CU=m"
+
+            # MediaTek MT7601U Driver
+            echo "CONFIG_WLAN_VENDOR_MEDIATEK=y"
+            echo "CONFIG_MT7601U=m"
+
+            # Modern Realtek RTL8XXXU Suite
+            echo "CONFIG_RTL8XXXU=m"
+
+            # Firmware + USB Layouts
+            echo "CONFIG_FW_LOADER=y"
+            echo "CONFIG_USB_SUPPORT=y"
+            echo "CONFIG_USB_NET_DRIVERS=y"
+            echo "CONFIG_USB_USBNET=y"
+
+            # Radio Blocks
+            echo "CONFIG_RFKILL=y"
+            echo "CONFIG_RFKILL_LEDS=y"
+
+            # Cryptographic Layout Enforcements
+            echo "CONFIG_CRYPTO_ARC4=m"
+            echo "CONFIG_CRYPTO_ECB=m"
+            echo "CONFIG_CRYPTO_AES=y"
+            echo "CONFIG_CRYPTO_MICHAEL_MIC=m"
+            echo "CONFIG_CRC_CCITT=m"
+            echo "CONFIG_CRC_ITU_T=m"
+
+            echo "CONFIG_WERROR=n"
+          } >> gki_defconfig
+
+      - name: Copy SUSFS kernel patches
+        run: |
+          cd kernel_workspace/common
+          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
+
+      - name: Apply android12-5.10 pre-patch compatibility fixes
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if [ "${SUBLEVEL}" -le "43" ]; then
+            perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\s*\(\s*[^,]+,/size_t this_len = min_t(size_t,/' fs/proc/base.c
+          fi
+          if [ "${SUBLEVEL}" -le "117" ]; then
+            sed -i '/^[[:space:]]*\/\*$/,/^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$/d' fs/notify/fdinfo.c
+            perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
+            perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
+          fi
+
+      - name: Apply SUSFS kernel patch
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
+
+      - name: Fix SUSFS set_nameidata argument mismatch
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
+
+      - name: Revert android12-5.10 pre-patch compatibility fixes
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if [ "${SUBLEVEL}" -le "43" ]; then
+            sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
+          fi
+          if [ "${SUBLEVEL}" -le "117" ]; then
+            perl -i -pe 's/^(\s+if \(inode\)\s+\{)$/$1\n\t\t\/*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t *\/\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/m' fs/notify/fdinfo.c
+            perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
+            perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
+          fi
+
+      - name: Apply SUSFS show_pad fix
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if [ "${SUBLEVEL}" -le "209" ]; then
+            sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
+          fi
+
+      - name: Setup ReSukiSU
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          curl -LSs "githubusercontent.com" | bash
+
+      - name: Setup Baseband Guard (BBG)
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 githubusercontent.com | bash
+          echo "BBG_COMMIT=$(git -C Baseband-guard rev-parse --short HEAD 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
+
+      - name: Configure Baseband Guard LSM
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+          if ! grep -q "baseband_guard" security/Kconfig; then
+            echo "::error::baseband_guard not found in security/Kconfig after patch — BBG setup likely failed"
+            exit 1
+          fi
+          echo "[+] baseband_guard wired into security/Kconfig:"
+          grep -n "baseband_guard" security/Kconfig || true
+
+      - name: Set Baseband Guard Config
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          echo "CONFIG_BBG=y" >> gki_defconfig
+
+      - name: Apply BBRv3 backport
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          git clone --depth=1 github.com /tmp/wildpatches
+          BBRV3_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
+          BBR_CONG_NAME="bbr"
+          BBRV3_PATCH_APPLIED="false"
+          if [ -f "$BBRV3_PATCH" ] && patch -p1 < "$BBRV3_PATCH"; then
+            BBRV3_PATCH_APPLIED="true"
+            DETECTED="$(grep -rhoE '\.name\s*=\s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
+            [ -n "$DETECTED" ] && BBR_CONG_NAME="$DETECTED"
+          fi
+          echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
+          echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
+
+      - name: Set networking / TCP congestion configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_TCP_CONG_ADVANCED=y"
+            echo "CONFIG_TCP_CONG_BBR=y"
+            echo "CONFIG_TCP_CONG_CUBIC=y"
+            echo "CONFIG_TCP_CONG_BIC=y"
+            echo "CONFIG_TCP_CONG_WESTWOOD=y"
+            echo "CONFIG_TCP_CONG_HTCP=y"
+            if [ "${BBRV3_PATCH_APPLIED}" = "true" ]; then
+              echo "CONFIG_TCP_CONG_BBR3=y"
+            fi
+            echo "CONFIG_DEFAULT_TCP_CONG=${BBR_CONG_NAME}"
+            echo "CONFIG_NET_SCH_FQ=y"
+            echo "CONFIG_NET_SCH_FQ_CODEL=y"
+            echo "CONFIG_NET_SCH_CAKE=y"
+          } >> gki_defconfig
+
+      - name: Apply NTSync patches
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if [ "${SUBLEVEL}" -le "208" ]; then
+            curl -fsSL -o /tmp/0003-lockdep-assert-none-held.patch githubusercontent.com
+            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || true
+          fi
+          curl -fsSL -o /tmp/ntsync_compat_android12-5.10.patch githubusercontent.com
+          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || true
+          curl -fsSL -o /tmp/ntsync_base.patch githubusercontent.com
+          patch -p1 < /tmp/ntsync_base.patch || true
+          echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
+
+      - name: Apply Droidspaces kABI-safe patches
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          DROIDSPACES_KABI_OK="true"
+          curl -fsSL -o /tmp/droidspaces_sysvipc_kabi.patch githubusercontent.com
+          if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
+            DROIDSPACES_KABI_OK="false"
+          fi
+          curl -fsSL -o /tmp/droidspaces_posix_mqueue_kabi.patch githubusercontent.com
+          if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
+            DROIDSPACES_KABI_OK="false"
+          fi
+          echo "DROIDSPACES_KABI_OK=${DROIDSPACES_KABI_OK}" >> "$GITHUB_ENV"
+
+      - name: Set Droidspaces configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
+            {
+              echo "CONFIG_SYSVIPC=y"
+              echo "CONFIG_SYSVIPC_SYSCTL=y"
+              echo "CONFIG_POSIX_MQUEUE=y"
+              echo "CONFIG_POSIX_MQUEUE_SYSCTL=y"
+              echo "CONFIG_IPC_NS=y"
+            } >> gki_defconfig
+          fi
+          {
+            echo "CONFIG_NAMESPACES=y"
+            echo "CONFIG_NET_NS=y"
+            echo "CONFIG_CGROUPS=y"
+            echo "CONFIG_PID_NS=y"
+            echo "CONFIG_USER_NS=y"
+            echo "CONFIG_DEVTMPFS=y"
+            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
+            echo "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
+            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y"
+            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
+            echo "CONFIG_IP_SET=y"
+            echo "CONFIG_IP_SET_HASH_IP=y"
+            echo "CONFIG_IP_SET_HASH_NET=y"
+            echo "CONFIG_NETFILTER_XT_SET=y"
+            echo "CONFIG_TMPFS_POSIX_ACL=y"
+            echo "CONFIG_TMPFS_XATTR=y"
+          } >> gki_defconfig
+
+      - name: Apply gaming/latency perf tuning
+        if: ${{ github.event.inputs.enable_gaming_perf_tune == 'true' }}
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          patch_default() {
+            local label="$1" old_re="$2" new="$3"; shift 3
+            local files=("$@")
+            local d='/'
+            for f in "${files[@]}"; do
+              [ -f "$f" ] || continue
+              if grep -qE -- "$old_re" "$f"; then
+                if sed -i -E "s${d}${old_re}${d}${new}${d}" "$f"; then
+                  echo "  [ok] ${label} (in $f)"
+                  return 0
+                else
+                  echo "::warning::gaming-perf-tune: '${label}' matched in $f but sed edit failed, skipped"
+                  return 1
+                fi
+              fi
+            done
+            echo "::warning::gaming-perf-tune: '${label}' pattern not found, skipped (kernel version drift)"
+            return 1
+          }
+
+          echo "Kconfig: allow force-loading mismatched vendor modules"
+          echo "CONFIG_MODULE_FORCE_LOAD=y" >> arch/arm64/configs/gki_defconfig
+
+          echo "Reducing VFS cache pressure default (fs/dcache.c)"
+          patch_default "vfs_cache_pressure default 100->50" 'int[[:space:]]+sysctl_vfs_cache_pressure[[:space:]]+__read_mostly[[:space:]]*=[[:space:]]*100;' 'int sysctl_vfs_cache_pressure __read_mostly = 50;' fs/dcache.c || true
+
+          echo "Reducing freeze timeout (kernel/power/process.c, 20s->1s)"
+          patch_default "freeze_timeout_msecs 20000->1000" 'freeze_timeout_msecs[[:space:]]*=[[:space:]]*20[[:space:]]*\*[[:space:]]*MSEC_PER_SEC;' 'freeze_timeout_msecs = 1 * MSEC_PER_SEC;' kernel/power/process.c kernel/power/main.c kernel/power/suspend.c || true
+
+          echo "Reducing F2FS urgent GC sleep time (fs/f2fs/gc.h, 500ms->50ms)"
+          patch_default "F2FS urgent GC sleep 500->50" '#define[[:space:]]+DEF_GC_THREAD_URGENT_SLEEP_TIME[[:space:]]+500' '#define DEF_GC_THREAD_URGENT_SLEEP_TIME\t50' fs/f2fs/gc.h fs/f2fs/f2fs.h || true
+
+          echo "Increasing PCI PME poll timeout (drivers/pci/pci.c, 1s->4s)"
+          patch_default "PME_TIMEOUT 1000->4000" '#define[[:space:]]+PME_TIMEOUT[[:space:]]+1000' '#define PME_TIMEOUT\t4000' drivers/pci/pci.c || true
+
+          echo "Raising cpuidle teo governor default rating"
+          patch_default "teo governor rating 19->25" '\.rating[[:space:]]*=[[:space:]]*19,' '.rating =\t25,' drivers/cpuidle/governors/teo.c || true
+
+          echo "Raising ext4 default journal commit interval (5s->30s)"
+          patch_default "ext4/jbd2 commit interval 5s->30s" '#define[[:space:]]+JBD2_DEFAULT_MAX_COMMIT_AGE[[:space:]]+5' '#define JBD2_DEFAULT_MAX_COMMIT_AGE\t30' include/linux/jbd2.h fs/jbd2/journal.c || true
+
+          echo "Lowering vm_swappiness default (60->30) for less aggressive swapping"
+          patch_default "vm_swappiness 60->30" 'int[[:space:]]+vm_swappiness[[:space:]]*=[[:space:]]*60;' 'int vm_swappiness = 30;' mm/vmscan.c || true
+
+          echo "Reducing CFS scheduler latency (6ms->4ms) for snappier task switching"
+          patch_default "sysctl_sched_latency 6000000->4000000" 'unsigned[[:space:]]+int[[:space:]]+sysctl_sched_latency[[:space:]]*=[[:space:]]*6000000ULL;' 'unsigned int sysctl_sched_latency = 4000000ULL;' kernel/sched/fair.c || true
+
+          echo "Reducing CFS min granularity (0.75ms->0.5ms)"
+          patch_default "sysctl_sched_min_granularity 750000->500000" 'unsigned[[:space:]]+int[[:space:]]+sysctl_sched_min_granularity[[:space:]]*=[[:space:]]*750000ULL;' 'unsigned int sysctl_sched_min_granularity = 500000ULL;' kernel/sched/fair.c || true
+
+          echo "Reducing CFS wakeup granularity (1ms->0.5ms) for faster preemption on wake"
+          patch_default "sysctl_sched_wakeup_granularity 1000000->500000" 'unsigned[[:space:]]+int[[:space:]]+sysctl_sched_wakeup_granularity[[:space:]]*=[[:space:]]*1000000UL;' 'unsigned int sysctl_sched_wakeup_granularity = 500000UL;' kernel/sched/fair.c || true
+
+          echo "Reducing task migration cost (0.5ms->0.25ms) for faster load balancing across cores"
+          patch_default "sysctl_sched_migration_cost 500000->250000" 'const_debug[[:space:]]+unsigned[[:space:]]+int[[:space:]]+sysctl_sched_migration_cost[[:space:]]*=[[:space:]]*500000UL;' 'const_debug unsigned int sysctl_sched_migration_cost = 250000UL;' kernel/sched/fair.c || true
+
+          echo "Raising vm.max_map_count default (65530->1048576) for mmap-heavy games/emulators"
+          patch_default "DEFAULT_MAX_MAP_COUNT (USHRT_MAX-5)->1048576" '#define[[:space:]]+DEFAULT_MAX_MAP_COUNT[[:space:]]*\([[:space:]]*USHRT_MAX[[:space:]]*-[[:space:]]*MAPCOUNT_ELF_CORE_MARGIN[[:space:]]*\)' '#define DEFAULT_MAX_MAP_COUNT (1048576)' include/linux/mm.h || true
+
+          echo "Lowering dirty_background_ratio (10->5) to complement dirty_ratio tweak"
+          patch_default "dirty_background_ratio 10->5" 'int[[:space:]]+dirty_background_ratio[[:space:]]*=[[:space:]]*10;' 'int dirty_background_ratio = 5;' mm/page-writeback.c || true
+
+          echo "Reducing dirty page expire interval (30s->10s) to avoid large writeback stalls"
+          patch_default "dirty_expire_interval 3000->1000 (centisecs)" 'unsigned[[:space:]]+int[[:space:]]+dirty_expire_interval[[:space:]]*=[[:space:]]*30[[:space:]]*\*[[:space:]]*100;' 'unsigned int dirty_expire_interval = 10 * 100;' mm/page-writeback.c || true
+
+          echo "Raising min_free_kbytes floor slightly for smoother allocs under memory pressure"
+          patch_default "min_free_kbytes floor 128->256 (in pages, KB)" 'int[[:space:]]+min_free_kbytes[[:space:]]*=[[:space:]]*1024;' 'int min_free_kbytes = 2048;' mm/page_alloc.c || true
+
+          echo "Lowering dirty_ratio default for snappier writeback under load"
+          patch_default "vm dirty_ratio 20->10" 'int[[:space:]]+vm_dirty_ratio[[:space:]]*=[[:space:]]*20;' 'int vm_dirty_ratio = 10;' mm/page-writeback.c || true
+
+          echo "Enabling 1000Hz kernel tick (lower scheduling latency)"
+          echo "CONFIG_HZ_1000=y" >> arch/arm64/configs/gki_defconfig
+
+          echo "Enabling Kyber/Deadline I/O schedulers"
+          echo "CONFIG_MQ_IOSCHED_KYBER=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_MQ_IOSCHED_DEADLINE=y" >> arch/arm64/configs/gki_defconfig
+
+      - name: Apply custom kernel branding
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          mv scripts/setlocalversion scripts/setlocalversion.orig
+          chmod +x scripts/setlocalversion.orig
+          cat > scripts/setlocalversion << 'EOF'
+          #!/bin/sh
+          printf -- '-BLAZE-STABLE-V1'
+          EOF
+          chmod +x scripts/setlocalversion
+
+      - name: Disable strict ABI/KMI checks and module list validations
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          cd common
+          sed -i 's/check_defconfig//' build.config.gki 2>/dev/null || true
+          for f in build.config build.config.gki build.config.gki.aarch64 build.config.common build.config.aarch64; do
+            [ -f "$f" ] || continue
+            perl -0777 -i -pe 's/KMI_SYMBOL_LIST="[^"]*"/KMI_SYMBOL_LIST=""/gs' "$f"
+            perl -0777 -i -pe 's/ADDITIONAL_KMI_SYMBOL_LISTS="[^"]*"/ADDITIONAL_KMI_SYMBOL_LISTS=""/gs' "$f"
+            perl -0777 -i -pe 's/MODULES_LIST="[^"]*"/MODULES_LIST=""/gs' "$f"
+            perl -0777 -i -pe 's/MODULES_ORDER="[^"]*"/MODULES_ORDER=""/gs' "$f"
+            sed -i 's/^KMI_SYMBOL_LIST=[^"]*/KMI_SYMBOL_LIST=/' "$f"
+            sed -i 's/^ADDITIONAL_KMI_SYMBOL_LISTS=[^"]*/ADDITIONAL_KMI_SYMBOL_LISTS=/' "$f"
+            sed -i 's/^MODULES_LIST=[^"]*/MODULES_LIST=/' "$f"
+            sed -i 's/^MODULES_ORDER=[^"]*/MODULES_ORDER=/' "$f"
+            grep -q '^KMI_SYMBOL_LIST_STRICT_MODE=' "$f" && sed -i 's/^KMI_SYMBOL_LIST_STRICT_MODE=.*/KMI_SYMBOL_LIST_STRICT_MODE=0/' "$f"
+            grep -q '^TRIM_NONLISTED_KMI=' "$f" && sed -i 's/^TRIM_NONLISTED_KMI=.*/TRIM_NONLISTED_KMI=0/' "$f"
+            grep -q '^KMI_ENFORCED=' "$f" && sed -i 's/^KMI_ENFORCED=.*/KMI_ENFORCED=0/' "$f"
+            grep -q '^ABI_DEFINITION=' "$f" && sed -i 's/^ABI_DEFINITION=.*/ABI_DEFINITION=/' "$f"
+            grep -q '^TIDY_ABI=' "$f" && sed -i 's/^TIDY_ABI=.*/TIDY_ABI=0/' "$f"
+          done
+          echo "---- resulting KMI/ABI-related lines ----"
+          grep -RhnE '^(KMI_SYMBOL_LIST|KMI_SYMBOL_LIST_STRICT_MODE|ADDITIONAL_KMI_SYMBOL_LISTS|TRIM_NONLISTED_KMI|KMI_ENFORCED|ABI_DEFINITION|TIDY_ABI|MODULES_LIST|MODULES_ORDER)=' build.config* || true
+          echo "---- sanity check: no orphan bare 'android/...' lines outside quotes ----"
+          grep -RnE '^\s*android/abi_gki' build.config || echo "clean"
+
+      - name: Build kernel
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          LTO=thin \
+          BUILD_CONFIG=common/build.config.gki.aarch64 \
+          USE_CCACHE=1 \
+          CCACHE_DIR="${CCACHE_DIR}" \
+          LLVM=1 LLVM_IAS=1 \
+          LD="${TC_DIR}/bin/ld.lld" \
+          AR="${TC_DIR}/bin/llvm-ar" \
+          NM="${TC_DIR}/bin/llvm-nm" \
+          OBJCOPY="${TC_DIR}/bin/llvm-objcopy" \
+          OBJDUMP="${TC_DIR}/bin/llvm-objdump" \
+          STRIP="${TC_DIR}/bin/llvm-strip" \
+          CC="${TC_DIR}/bin/clang" \
+          KMI_SYMBOL_LIST_STRICT_MODE=0 \
+          KMI_ENFORCED=0 \
+          TRIM_NONLISTED_KMI=0 \
+          TIDY_ABI=0 \
+          build/build.sh -j"$(nproc)"
+
+      - name: Verify final configs
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          CFG=$(find out -name ".config" | head -n1)
+          [ -n "$CFG" ]
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_BPF_SYSCALL CONFIG_UNICODE CONFIG_BBG; do
+            grep -q "^${SYM}=y$" "$CFG"
+          done
+
+      - name: Locate built Image and Modules
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          IMG=$(find out -path "*dist/Image" | head -n1)
+          if [ -z "$IMG" ]; then
+            IMG=$(find out -name "Image" | head -n1)
+          fi
+          [ -n "$IMG" ]
+          echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
+          DIST_DIR=$(dirname "${IMG}")
+          echo "DIST_DIR=kernel_workspace/${DIST_DIR}" >> "$GITHUB_ENV"
+
+      - name: Package Clean AnyKernel3 Kernel Zip
+        run: |
+          set -euo pipefail
+          git clone --depth=1 github.com -b gki-2.0 ak3
+          cp "${{ env.IMG_PATH }}" ak3/Image
+          cd ak3
+          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
+
+      - name: Generate Mizdrake7 Style Wireless Magisk Module
+        run: |
+          set -euo pipefail
+          mkdir -p wireless_module/system/lib/modules
+          mkdir -p wireless_module/META-INF/com/google/android
+          if [ -f "${{ env.DIST_DIR }}/kernel_modules.tar.gz" ]; then
+            tar -xzf "${{ env.DIST_DIR }}/kernel_modules.tar.gz" -C wireless_module/system/lib/modules
+          else
+            find kernel_workspace/out -name "*.ko" -exec cp {} wireless_module/system/lib/modules/ \; || true
+          fi
+
+          cat << 'EOF' > wireless_module/module.prop
+          id=Wireless-firmware
+          name=Wireless NetHunter Drivers & Firmware
+          version=v3
+          versionCode=3
+          author=mizdrake7
+          description=NetHunter Wireless Drivers packaged like mizdrake7 style
+          EOF
+
+          cat << 'EOF' > wireless_module/service.sh
+          #!/bin/sh
+          sleep 25
+          LOG=/data/local/tmp/nethunter_wireless.log
+          MODDIR=/data/adb/modules/Wireless-firmware/system/lib/modules
+          echo "===== $(date) =====" >> $LOG
+          echo /system/etc/firmware > /sys/module/firmware_class/parameters/path 2>>$LOG
+          load(){
+            MOD="$1"
+            if [ -f "$MODDIR/$MOD.ko" ]; then
+              echo "Loading $MOD" >> $LOG
+              insmod "$MODDIR/$MOD.ko" >>$LOG 2>&1
+            else
+              echo "$MOD missing" >> $LOG
+            fi
+          }
+          if ! lsmod | grep -q "cfg80211"; then load cfg80211; fi
+          if ! lsmod | grep -q "mac80211"; then load mac80211; fi
+          load ath
+          load ath9k_hw
+          load ath9k_common
+          load rt2x00lib
+          load rt2x00usb
+          load rt2800lib
+          load ath9k_htc
+          load carl9170
+          load rt2800usb
+          load rtl8187
+          load rtl8192cu
+          rmmod mt7601u 2>/dev/null
+          load mt7601u
+          load rtl8xxxu
+          dmesg | grep -i -E "mt7601|firmware|cfg80211|mac80211|ath|ath9k|rt2x00|rt2800|rtl8187|rtl8xxxu" >> $LOG 2>&1
+          echo "Wireless modules finished" >> $LOG
+          EOF
+          chmod +x wireless_module/service.sh
+
+          cat << 'EOF' > wireless_module/META-INF/com/google/android/update-binary
+          #!/sbin/sh
+          OUTFD=$2
+          ZIPFILE=$3
+          mount /data 2>/dev/null
+          unzip -o "$ZIPFILE" 'system/*' -d /data/adb/modules/Wireless-firmware/ 2>/dev/null
+          cp -rf service.sh /data/adb/modules/Wireless-firmware/
+          cp -rf module.prop /data/adb/modules/Wireless-firmware/
+          touch /data/adb/modules/Wireless-firmware/update
+          exit 0
+          EOF
+          chmod +x wireless_module/META-INF/com/google/android/update-binary
+
+          cd wireless_module
+          zip -r9 -q "../Wireless_Nethunter_Firmware_v3.zip" .
+
+      - name: Repack vendor_boot with NetHunter modules (mizdrake7 style, MTK only)
+        run: |
+          set -euo pipefail
+          VENDOR_BOOT="kernel_workspace/vendor_boot.img"
+          if [ ! -f "$VENDOR_BOOT" ]; then
+            echo "No vendor_boot.img supplied — skipping vendor_boot repack (GKI target has none)."
+            exit 0
+          fi
+          sudo apt-get install -y lz4 cpio
+          mkdir -p tools
+          curl -fsSL -o tools/unpack_bootimg.py githubusercontent.com 2>/dev/null || echo "unpack_bootimg.py missing"
+          curl -fsSL -o tools/mkbootimg.py githubusercontent.com 2>/dev/null || echo "mkbootimg.py missing"
+          if [ ! -s tools/unpack_bootimg.py ] || [ ! -s tools/mkbootimg.py ]; then
+            echo "Required mkbootimg tools missing — skipping vendor_boot repack."
+            exit 0
+          fi
+
+          WORK="$(mktemp -d)"
+          cp "$VENDOR_BOOT" "$WORK/vendor_boot.img"
+          cp Wireless_Nethunter_Firmware_v3.zip "$WORK/nethunter_modules.zip"
+          cd "$WORK"
+
+          python3 "$OLDPWD/tools/unpack_bootimg.py" --boot_img vendor_boot.img --out out > info.txt
+
+          ORIG_SIZE=$(stat -c "%s" vendor_boot.img)
+          HEADER=$(grep "vendor boot image header version" info.txt | awk '{print $NF}')
+          PAGESIZE=$(grep "page size" info.txt | awk '{print $NF}')
+          BASE=$(grep "kernel load address" info.txt | awk '{print $NF}')
+          RAMDISK_ADDR=$(grep "ramdisk load address" info.txt | awk '{print $NF}')
+          TAGS=$(grep "kernel tags load address" info.txt | awk '{print $NF}')
+          DTB_ADDR=$(grep "dtb address" info.txt | awk '{print $NF}')
+          CMDLINE=$(grep "vendor command line args" info.txt | cut -d: -f2- | sed 's/^ //')
+
+          mkdir ramdisk nh
+          cd ramdisk
+          lz4 -d ../out/vendor_ramdisk00 -c | cpio -idmv >/dev/null
+
+          cd ../nh
+          unzip -oq ../nethunter_modules.zip
+          cp -fv *.ko ../ramdisk/lib/modules/ 2>/dev/null || echo "no top-level .ko in module zip (check its layout)"
+
+          cd ../ramdisk
+          find . | cpio -o -H newc 2>/dev/null | lz4 -l > ../vendor_ramdisk_new
+          cd ..
+
+          python3 "$OLDPWD/tools/mkbootimg.py" \
+            --vendor_boot vendor_boot_new.img \
+            --header_version "$HEADER" \
+            --pagesize $((PAGESIZE)) \
+            --base "$BASE" \
+            --kernel_offset 0x0 \
+            --ramdisk_offset $((RAMDISK_ADDR-BASE)) \
+            --tags_offset $((TAGS-BASE)) \
+            --dtb_offset $((DTB_ADDR-BASE)) \
+            --vendor_ramdisk vendor_ramdisk_new \
+            --dtb out/dtb \
+            --vendor_cmdline "$CMDLINE"
+
+          cp vendor_boot_new.img "$OLDPWD/nh-vendor_boot.img"
+          truncate -s "$ORIG_SIZE" "$OLDPWD/nh-vendor_boot.img"
+          cd "$OLDPWD"
+          python3 tools/unpack_bootimg.py --boot_img nh-vendor_boot.img --out /tmp/verify_out
+          echo "Generated nh-vendor_boot.img"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.device_name }}-build
+          path: |
+            *.zip
+            nh-vendor_boot.img
+          retention-days: 14
+          if-no-files-found: warn
